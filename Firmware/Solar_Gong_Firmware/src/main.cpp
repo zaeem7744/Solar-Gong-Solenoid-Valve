@@ -2,8 +2,6 @@
 #include <Wire.h>
 #include <Adafruit_VEML7700.h>
 #include <Preferences.h>
-#include "esp_sleep.h"
-#include "driver/rtc_io.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
 
@@ -11,7 +9,7 @@
 static constexpr gpio_num_t RELAY_GPIO = GPIO_NUM_19;
 static constexpr gpio_num_t BUTTON_GPIO = GPIO_NUM_4;
 static constexpr gpio_num_t LED_GPIO = GPIO_NUM_5;
-static constexpr bool RELAY_ACTIVE_HIGH = false;                   
+static constexpr bool RELAY_ACTIVE_HIGH = false;                  
 
 // Light sensor (VEML7700 over I2C)
 Adafruit_VEML7700 veml;
@@ -21,35 +19,26 @@ Preferences preferences;
 
 // ---------------- Behavior configuration ----------------
 static constexpr float DEFAULT_LIGHT_THRESHOLD_LUX = 100.0f;
-static constexpr float HYSTERESIS_LUX = 20.0f;
 static constexpr unsigned long VALVE_OPEN_TIME_MS = 2000;
-static constexpr uint64_t SLEEP_DURATION_US = 2ULL * 60ULL * 1000000ULL; // 2 minutes for testing
-// static constexpr uint64_t SLEEP_DURATION_US = 20ULL * 3600ULL * 1000000ULL; // 20 hours for production
 
 // Button timing
 static constexpr unsigned long LONG_PRESS_DURATION_MS = 3000;  // 3 seconds to enter calibration
 static constexpr unsigned long SHORT_PRESS_MAX_MS = 500;       // Under 0.5s = toggle
 static constexpr unsigned long DEBOUNCE_DELAY_MS = 50;
 
-// Testing configuration - day cycle
-static constexpr unsigned long DAY_CYCLE_MS = 60000;  // 60 seconds = 1 "day" for testing
+// Day cycle configuration
+static constexpr unsigned long DAY_CYCLE_MS = 20UL * 60UL * 60UL * 1000UL;  // 20 hours = 1 "day"
 static constexpr unsigned long SENSOR_CHECK_INTERVAL_MS = 10000;  // Check sensor every 10 seconds
 
 // RTC memory to persist data during deep sleep
 RTC_DATA_ATTR bool triggeredToday = false;
 RTC_DATA_ATTR bool manualMode = false;
 
-// Global flag to control sleep behavior
-bool stayAwake = false;
-unsigned long awakeStartTime = 0;
-static constexpr unsigned long AWAKE_TIMEOUT_MS = 20000; // 20 seconds
-
 // Sensor monitoring timing
 unsigned long lastSensorCheck = 0;
 unsigned long dayStartTime = 0;
 
 // ---------------- Forward declarations ----------------
-void enterDeepSleep();
 void setRelay(bool on);
 void setLED(bool on);
 float readLuxAveraged(uint8_t samples = 5);
@@ -164,9 +153,9 @@ void handleButton() {
         blinkLED(3, 100, 100);
         delay(500);
         
-        stayAwake = true;
-        awakeStartTime = millis();
         calibrationMode();
+        // Reset sensor check timing after calibration
+        lastSensorCheck = millis();
         return;
       }
       
@@ -181,9 +170,7 @@ void handleButton() {
       manualMode = !manualMode;
       setRelay(manualMode);
       setLED(manualMode);
-      stayAwake = true;
-      awakeStartTime = millis();
-      Serial.print("✓ Relay ");
+      Serial.print("✓ Manual override - Relay ");
       Serial.println(manualMode ? "ON" : "OFF");
       delay(500);
     }
@@ -219,8 +206,10 @@ void setup() {
   if (!veml.begin()) {
     Serial.println("✗ Sensor error");
     blinkLED(5, 100, 100);
-    enterDeepSleep();
-    return;
+    // Sensor required for operation; halt here
+    while (true) {
+      delay(1000);
+    }
   }
   
   veml.setGain(VEML7700_GAIN_1_8);
@@ -236,26 +225,7 @@ void setup() {
   lastSensorCheck = millis();
   
   Serial.println("Starting continuous monitoring mode");
-  Serial.println("Day cycle: 60 seconds | Check interval: 10 seconds\n");
-  
-  // Keep device awake for continuous monitoring
-  stayAwake = true;
-  awakeStartTime = millis();
-}
-
-void enterDeepSleep() {
-  Serial.print("Sleeping for ");
-  Serial.print((unsigned long)(SLEEP_DURATION_US / 1000000ULL));
-  Serial.println(" seconds...\n");
-  Serial.flush();
-  
-  digitalWrite(LED_GPIO, LOW);
-  digitalWrite(RELAY_GPIO, RELAY_ACTIVE_HIGH ? LOW : HIGH);
-  
-  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
-  esp_sleep_enable_ext0_wakeup(BUTTON_GPIO, 0);
-  
-  esp_deep_sleep_start();
+  Serial.println("Day cycle: 20 hours | Check interval: 10 seconds\\n");
 }
 
 void loop() {
@@ -303,38 +273,7 @@ void loop() {
   }
   
   // Check for button presses
-  if (digitalRead(BUTTON_GPIO) == LOW) {
-    delay(DEBOUNCE_DELAY_MS);
-    unsigned long pressStart = millis();
-    
-    // Wait while button is held
-    while (digitalRead(BUTTON_GPIO) == LOW) {
-      unsigned long pressDuration = millis() - pressStart;
-      
-      // Long press - enter calibration
-      if (pressDuration >= LONG_PRESS_DURATION_MS) {
-        waitForButtonRelease();
-        blinkLED(3, 100, 100);
-        delay(500);
-        calibrationMode();
-        // Reset timers after calibration
-        lastSensorCheck = millis();
-        return;
-      }
-      delay(10);
-    }
-    
-    // Short press - toggle relay
-    unsigned long pressDuration = millis() - pressStart;
-    if (pressDuration < SHORT_PRESS_MAX_MS) {
-      manualMode = !manualMode;
-      setRelay(manualMode);
-      setLED(manualMode);
-      Serial.print("✓ Manual override - Relay ");
-      Serial.println(manualMode ? "ON" : "OFF");
-      delay(500);
-    }
-  }
+  handleButton();
   
   delay(100);
 }
